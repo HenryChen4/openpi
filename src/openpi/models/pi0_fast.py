@@ -240,6 +240,7 @@ class Pi0FAST(_model.BaseModel):
         *,
         max_decoding_steps: int | at.Int[at.Array, ""] = 256,
         temperature: float = 0.0,
+        n_action_samples: int = 1
     ) -> _model.Actions:
         # TODO: this is a hack to get the image keys.
         observation = _model.preprocess_observation(
@@ -262,52 +263,118 @@ class Pi0FAST(_model.BaseModel):
         # pad attention mask to set the size of the KV cache (prefill_size + max_decoding_steps)
         prefix_attn_mask = jnp.pad(prefix_attn_mask, ((0, 0), (0, 0), (0, max_decoding_steps)))
         prefix_positions = jnp.cumsum(prefix_mask, axis=-1) - 1
-        prefix_logits, kv_cache, _ = self.PaliGemma.llm(
+        prefix_logits, kv_cache, aux_out = self.PaliGemma.llm(
             embedded_prefix=prefix_token_embeddings, mask=prefix_attn_mask, positions=prefix_positions, decode=True
         )
 
         # prepare decoding -- final logit decodes the first token
         last_logit = prefix_logits[:, -1:]
-        output_tokens = jnp.zeros((last_logit.shape[0], max_decoding_steps))
 
-        def step(carry):
-            rng, last_logit, output_tokens, cache, _, step = carry
+        # Below is copied from https://github.com/vla-safe/openpi/blob/9c99ed53f6a0c9be93a1c63cee5792620777d96b/src/openpi/models/pi0_fast.py#L268
+        batch = last_logit.shape[0]
 
-            # Sample token from last logit
-            # Split RNG for this step
-            rng, rng_step = jax.random.split(rng)
-            token = jax.lax.cond(
-                temperature > 0.0,
-                lambda _: jax.random.categorical(rng_step, last_logit / temperature, axis=-1),
-                lambda _: jnp.argmax(last_logit, axis=-1),
-                operand=None,
-            )
-            output_tokens = put_along_last_axis(output_tokens, jnp.broadcast_to(step, (token.shape[0], 1)), token)
+        def _sample_one(rng_one):
+            aux_accum = {
+                "encoded": jnp.zeros((batch, max_decoding_steps+1, self.PaliGemma.llm.module.width), dtype=last_logit.dtype),
+                "logits": jnp.zeros((batch, max_decoding_steps+1, self.PaliGemma.llm.module.vocab_size), dtype=last_logit.dtype),
+                "pre_logits": jnp.zeros((batch, max_decoding_steps+1, self.PaliGemma.llm.module.width), dtype=last_logit.dtype),
+            }
+            aux_accum["encoded"] = aux_accum["encoded"].at[:,0,:].set(aux_out["encoded"][:, -1, :])
+            aux_accum["logits"] = aux_accum["logits"].at[:,0,:].set(aux_out["logits"][:, -1, :])
+            aux_accum["pre_logits"] = aux_accum["pre_logits"].at[:,0,:].set(aux_out["pre_logits"][:, -1, :])
 
-            # Check for early stopping --> stop if all batch elements have EOS token
-            has_eos = jnp.any(token == PALIGEMMA_EOS_TOKEN, axis=-1)
-            all_eos = jnp.all(has_eos)
+            output_tokens = jnp.zeros((last_logit.shape[0], max_decoding_steps), dtype=jnp.int32)
+            all_eos = False
+            step = 0
 
-            # Decode one step
-            token_embedding = self.PaliGemma.llm(token, embed_only=True)
-            positions = prefill_len[:, None] + step + 1
-            mask = jnp.logical_and(
-                jnp.arange(prefill_size + max_decoding_steps)[None, None, :] >= prefix_start[:, None, None],
-                jnp.arange(prefill_size + max_decoding_steps)[None, None, :]
-                < (jnp.broadcast_to(prefill_size + step + 1, (prefix_start.shape[0], 1, 1))),
-            )
-            last_logit, kv_cache, _ = self.PaliGemma.llm(
-                embedded_prefix=token_embedding, mask=mask, positions=positions, decode=True, kv_cache=cache
-            )
+            def cond(carry):
+                _, _, _, all_eos, step, _ = carry
+                return (~all_eos) & (step < max_decoding_steps)
 
-            return rng, last_logit, output_tokens, kv_cache, all_eos, step + 1
+            def body(c):
+                last_logit, tokens, cache, eos, s, aux = c
+                # sampling
+                token = (jax.random.categorical(rng_one, last_logit/temperature, axis=-1)
+                         if temperature > 0 else jnp.argmax(last_logit, axis=-1))
+                tokens = put_along_last_axis(tokens, jnp.broadcast_to(s, (token.shape[0],1)), token)
+                eos_mask = jnp.any(token == PALIGEMMA_EOS_TOKEN, axis=-1)
+                all_done = jnp.all(eos_mask)
 
-        def cond(carry):
-            _, _, _, _, all_eos, step = carry
-            return (~all_eos) & (step < max_decoding_steps)
+                emb = self.PaliGemma.llm(token, embed_only=True)
+                pos = prefill_len[:, None] + s + 1
+                mask = jnp.logical_and(
+                    jnp.arange(prefill_size+max_decoding_steps)[None,None,:] >= prefix_start[:,None,None],
+                    jnp.arange(prefill_size+max_decoding_steps)[None,None,:] < (prefill_size + s + 1),
+                )
+                last_logit, new_cache, out = self.PaliGemma.llm(
+                    embedded_prefix=emb, mask=mask, positions=pos, decode=True, kv_cache=cache
+                )
+                aux["encoded"] = aux["encoded"].at[:, s+1, :].set(out["encoded"][...,0,:])
+                aux["logits"] = aux["logits"].at[:, s+1, :].set(out["logits"][...,0,:])
+                aux["pre_logits"] = aux["pre_logits"].at[:, s+1, :].set(out["pre_logits"][...,0,:])
+                return last_logit, tokens, new_cache, all_done, s+1, aux
 
-        # Use lax.while_loop so we can jit the full decoding loop.
-        _, _, output_tokens, _, _, _ = jax.lax.while_loop(
-            cond, step, (rng, last_logit, output_tokens, kv_cache, False, 0)
-        )
-        return output_tokens
+            init = (last_logit, output_tokens, kv_cache, all_eos, step, aux_accum)
+            _, tokens, _, _, final_step, final_aux = jax.lax.while_loop(cond, body, init)
+            final_aux["decode_step"] = final_step[None]
+            return tokens, final_aux    
+
+        rngs = jax.random.split(rng, n_action_samples)
+        # tokens_vmap: (n_samples, batch, max_steps)
+        # aux_vmap["encoded"]: (n_samples, batch, max_steps+1, width), etc.
+        tokens_vmap, aux_vmap = jax.vmap(_sample_one)(rngs)
+
+        # now flatten sample‐and‐batch dims back into one big batch
+        tokens = tokens_vmap.reshape(-1, max_decoding_steps)
+        aux = {
+            "encoded"   : aux_vmap["encoded"].reshape(-1, max_decoding_steps+1, self.PaliGemma.llm.module.width),
+            "logits"    : aux_vmap["logits"].reshape(-1, max_decoding_steps+1, self.PaliGemma.llm.module.vocab_size),
+            "pre_logits": aux_vmap["pre_logits"].reshape(-1, max_decoding_steps+1, self.PaliGemma.llm.module.width),
+            # if you kept decode_step as a scalar per sample in _sample_one, it'll come out (n_samples,)
+            "decode_step": aux_vmap["decode_step"].squeeze(),
+        }
+        
+
+        return tokens, aux            
+
+        # def step(carry):
+        #     rng, last_logit, output_tokens, cache, _, step = carry
+
+        #     # Sample token from last logit
+        #     # Split RNG for this step
+        #     rng, rng_step = jax.random.split(rng)
+        #     token = jax.lax.cond(
+        #         temperature > 0.0,
+        #         lambda _: jax.random.categorical(rng_step, last_logit / temperature, axis=-1),
+        #         lambda _: jnp.argmax(last_logit, axis=-1),
+        #         operand=None,
+        #     )
+        #     output_tokens = put_along_last_axis(output_tokens, jnp.broadcast_to(step, (token.shape[0], 1)), token)
+
+        #     # Check for early stopping --> stop if all batch elements have EOS token
+        #     has_eos = jnp.any(token == PALIGEMMA_EOS_TOKEN, axis=-1)
+        #     all_eos = jnp.all(has_eos)
+
+        #     # Decode one step
+        #     token_embedding = self.PaliGemma.llm(token, embed_only=True)
+        #     positions = prefill_len[:, None] + step + 1
+        #     mask = jnp.logical_and(
+        #         jnp.arange(prefill_size + max_decoding_steps)[None, None, :] >= prefix_start[:, None, None],
+        #         jnp.arange(prefill_size + max_decoding_steps)[None, None, :]
+        #         < (jnp.broadcast_to(prefill_size + step + 1, (prefix_start.shape[0], 1, 1))),
+        #     )
+        #     last_logit, kv_cache, _ = self.PaliGemma.llm(
+        #         embedded_prefix=token_embedding, mask=mask, positions=positions, decode=True, kv_cache=cache
+        #     )
+
+        #     return rng, last_logit, output_tokens, kv_cache, all_eos, step + 1
+
+        # def cond(carry):
+        #     _, _, _, _, all_eos, step = carry
+        #     return (~all_eos) & (step < max_decoding_steps)
+
+        # # Use lax.while_loop so we can jit the full decoding loop.
+        # _, _, output_tokens, _, _, _ = jax.lax.while_loop(
+        #     cond, step, (rng, last_logit, output_tokens, kv_cache, False, 0)
+        # )
+        # return output_tokens

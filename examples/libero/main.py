@@ -17,6 +17,9 @@ import tyro
 LIBERO_DUMMY_ACTION = [0.0] * 6 + [-1.0]
 LIBERO_ENV_RESOLUTION = 256  # resolution used to render training data
 
+def pi0_fast_embed(prelogits):
+    # load prelogits with client.infer(element)["pre_logits"]
+    return np.mean(prelogits, axis=0)
 
 @dataclasses.dataclass
 class Args:
@@ -141,7 +144,17 @@ def eval_libero(args: Args) -> None:
                         }
 
                         # Query model to get action
-                        action_chunk = client.infer(element)["actions"]
+                        test = client.infer(element)
+
+                        inference_obj = client.infer(element)
+                        action_chunk = inference_obj["actions"]
+                        prelogits = inference_obj["pre_logits"]
+
+                        print(prelogits.shape)
+                        embedding = pi0_fast_embed(prelogits)
+                        print(embedding.shape)
+                        print(embedding)
+
                         assert (
                             len(action_chunk) >= args.replan_steps
                         ), f"We want to replan every {args.replan_steps} steps, but policy only predicts {len(action_chunk)} steps."

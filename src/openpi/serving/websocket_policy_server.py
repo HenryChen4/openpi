@@ -59,6 +59,12 @@ class WebsocketPolicyServer:
 
                 infer_time = time.monotonic()
                 action = self._policy.infer(obs)
+
+                # patch to ensure data can be transmitted
+                action["encoded"] = action["encoded"].astype("float32")
+                action["logits"] = action["logits"].astype("float32")
+                action["pre_logits"] = action["pre_logits"].astype("float32")
+
                 infer_time = time.monotonic() - infer_time
 
                 action["server_timing"] = {

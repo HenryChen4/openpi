@@ -5,7 +5,9 @@ will compute the mean and standard deviation of the data in the dataset and save
 to the config assets directory.
 """
 
+import lerobot.common.datasets.lerobot_dataset as lerobot_dataset
 import numpy as np
+from torch.utils.data import ConcatDataset
 import tqdm
 import tyro
 
@@ -18,7 +20,11 @@ import openpi.transforms as transforms
 
 class RemoveStrings(transforms.DataTransformFn):
     def __call__(self, x: dict) -> dict:
-        return {k: v for k, v in x.items() if not np.issubdtype(np.asarray(v).dtype, np.str_)}
+        return {
+            k: v
+            for k, v in x.items()
+            if not np.issubdtype(np.asarray(v).dtype, np.str_)
+        }
 
 
 def create_torch_dataloader(
@@ -28,10 +34,13 @@ def create_torch_dataloader(
     model_config: _model.BaseModelConfig,
     num_workers: int,
     max_frames: int | None = None,
+    envgen_dataset_repo_id: str | None = None,
 ) -> tuple[_data_loader.Dataset, int]:
     if data_config.repo_id is None:
         raise ValueError("Data config must have a repo_id")
-    dataset = _data_loader.create_torch_dataset(data_config, action_horizon, model_config)
+    dataset = _data_loader.create_torch_dataset(
+        data_config, action_horizon, model_config
+    )
     dataset = _data_loader.TransformedDataset(
         dataset,
         [
@@ -41,6 +50,36 @@ def create_torch_dataloader(
             RemoveStrings(),
         ],
     )
+
+    if envgen_dataset_repo_id is not None:
+        envgen_dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(
+            envgen_dataset_repo_id
+        )
+        envgen_dataset = lerobot_dataset.LeRobotDataset(
+            envgen_dataset_repo_id,
+            delta_timestamps={
+                key: [
+                    t / envgen_dataset_meta.fps for t in range(action_horizon)
+                ]
+                for key in data_config.action_sequence_keys
+            },
+        )
+        envgen_dataset = _data_loader.TransformedDataset(
+            envgen_dataset,
+            [transforms.PromptFromLeRobotTask(envgen_dataset_meta.tasks)],
+        )
+        envgen_dataset = _data_loader.TransformedDataset(
+            envgen_dataset,
+            [
+                *data_config.repack_transforms.inputs,
+                *data_config.data_transforms.inputs,
+                # Remove strings since they are not supported by JAX and are not needed to compute norm stats.
+                RemoveStrings(),
+            ],
+        )
+
+        dataset = ConcatDataset([dataset, envgen_dataset])
+
     if max_frames is not None and max_frames < len(dataset):
         num_batches = max_frames // batch_size
         shuffle = True
@@ -63,7 +102,9 @@ def create_rlds_dataloader(
     batch_size: int,
     max_frames: int | None = None,
 ) -> tuple[_data_loader.Dataset, int]:
-    dataset = _data_loader.create_rlds_dataset(data_config, action_horizon, batch_size, shuffle=False)
+    dataset = _data_loader.create_rlds_dataset(
+        data_config, action_horizon, batch_size, shuffle=False
+    )
     dataset = _data_loader.IterableTransformedDataset(
         dataset,
         [
@@ -86,29 +127,52 @@ def create_rlds_dataloader(
     return data_loader, num_batches
 
 
-def main(config_name: str, max_frames: int | None = None):
+def main(
+    config_name: str,
+    envgen_dataset_repo_id: str | None = None,
+    max_frames: int | None = None,
+):
+    """
+    If envgen_dataset_repo_id is set, this will concatenate the dataset at
+    envgen_dataset_repo_id after the original dataset at config.data.repo_id
+    when computing normalization stats.
+    """
     config = _config.get_config(config_name)
     data_config = config.data.create(config.assets_dirs, config.model)
 
     if data_config.rlds_data_dir is not None:
         data_loader, num_batches = create_rlds_dataloader(
-            data_config, config.model.action_horizon, config.batch_size, max_frames
+            data_config,
+            config.model.action_horizon,
+            config.batch_size,
+            max_frames,
         )
     else:
         data_loader, num_batches = create_torch_dataloader(
-            data_config, config.model.action_horizon, config.batch_size, config.model, config.num_workers, max_frames
+            data_config,
+            config.model.action_horizon,
+            config.batch_size,
+            config.model,
+            config.num_workers,
+            max_frames,
+            envgen_dataset_repo_id,
         )
 
     keys = ["state", "actions"]
     stats = {key: normalize.RunningStats() for key in keys}
 
-    for batch in tqdm.tqdm(data_loader, total=num_batches, desc="Computing stats"):
+    for batch in tqdm.tqdm(
+        data_loader, total=num_batches, desc="Computing stats"
+    ):
         for key in keys:
             stats[key].update(np.asarray(batch[key]))
 
     norm_stats = {key: stats.get_statistics() for key, stats in stats.items()}
 
-    output_path = config.assets_dirs / data_config.repo_id
+    if envgen_dataset_repo_id is not None:
+        output_path = config.assets_dirs / envgen_dataset_repo_id
+    else:
+        output_path = config.assets_dirs / data_config.repo_id
     print(f"Writing stats to: {output_path}")
     normalize.save(output_path, norm_stats)
 

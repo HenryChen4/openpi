@@ -855,7 +855,7 @@ _CONFIGS = [
             extra_delta_transform=True,
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader(
-            "s3://openpi-assets/checkpoints/pi0_fast_libero/params"
+            "gs://openpi-assets/checkpoints/pi0_fast_libero/params"
         ),
         num_train_steps=30_000,
         freeze_filter=pi0_fast.Pi0FASTConfig(
@@ -880,7 +880,7 @@ _CONFIGS = [
             extra_delta_transform=True,
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader(
-            "s3://openpi-assets/checkpoints/pi0_fast_libero/params"
+            "gs://openpi-assets/checkpoints/pi0_fast_libero/params"
         ),
         num_train_steps=30_000,
         freeze_filter=pi0_fast.Pi0FASTConfig(

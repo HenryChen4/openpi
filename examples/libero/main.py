@@ -145,15 +145,16 @@ def eval_libero(args: Args) -> None:
 
                         # Query model to get action
                         test = client.infer(element)
+                        print(test)
 
                         inference_obj = client.infer(element)
                         action_chunk = inference_obj["actions"]
                         prelogits = inference_obj["pre_logits"]
 
-                        print(prelogits.shape)
-                        embedding = pi0_fast_embed(prelogits)
-                        print(embedding.shape)
-                        print(embedding)
+                        # print(prelogits.shape)
+                        # embedding = pi0_fast_embed(prelogits)
+                        # print(embedding.shape)
+                        # print(embedding)
 
                         assert (
                             len(action_chunk) >= args.replan_steps

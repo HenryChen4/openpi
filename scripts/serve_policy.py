@@ -71,7 +71,7 @@ DEFAULT_CHECKPOINT: dict[EnvMode, Checkpoint] = {
     ),
     EnvMode.LIBERO: Checkpoint(
         config="pi0_fast_libero",
-        dir="s3://openpi-assets/checkpoints/pi0_fast_libero",
+        dir="gs://openpi-assets/checkpoints/pi0_fast_libero",
     ),
 }
 

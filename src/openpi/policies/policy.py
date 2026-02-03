@@ -205,9 +205,6 @@ class PolicyRecorder(_base_policy.BasePolicy):
         }
         trimmed_results.update(meta_to_save)
 
-        print("CALLED")
-        print(trimmed_results)
-
         return trimmed_results
 
     def _process_pi0fast_logits(self, logits):

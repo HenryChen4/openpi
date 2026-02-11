@@ -1,7 +1,7 @@
-from collections.abc import Sequence
 import logging
 import pathlib
 import time
+from collections.abc import Sequence
 from typing import Any, TypeAlias
 
 import flax
@@ -9,14 +9,14 @@ import flax.traverse_util
 import jax
 import jax.numpy as jnp
 import numpy as np
-from openpi_client import base_policy as _base_policy
 import torch
-from typing_extensions import override
-
-from openpi import transforms as _transforms
 from openpi.models import model as _model
 from openpi.shared import array_typing as at
 from openpi.shared import nnx_utils
+from openpi_client import base_policy as _base_policy
+from typing_extensions import override
+
+from openpi import transforms as _transforms
 
 BasePolicy: TypeAlias = _base_policy.BasePolicy
 
@@ -49,7 +49,7 @@ class Policy(BasePolicy):
         """
         self._sample_actions = nnx_utils.module_jit(
             model.sample_actions,
-            static_argnames=("temperature", "n_action_samples")
+            static_argnames=("temperature", "n_action_samples"),
         )
 
         self._model = model
@@ -83,7 +83,7 @@ class Policy(BasePolicy):
         sample_action_outputs = self._sample_actions(
             sample_rng,
             _model.Observation.from_dict(inputs),
-            **self._sample_kwargs
+            **self._sample_kwargs,
         )
 
         if isinstance(sample_action_outputs, tuple):
@@ -95,20 +95,24 @@ class Policy(BasePolicy):
                 # process the output and cut off the unused positions
                 step = aux_outputs["decode_step"].max()
                 output_tokens_truncated = output_tokens[:, :step]
-                aux_outputs['encoded'] = aux_outputs['encoded'][:, :step]
-                aux_outputs['logits'] = aux_outputs['logits'][:, :step]
-                aux_outputs['pre_logits'] = aux_outputs['pre_logits'][:, :step]
+                aux_outputs["encoded"] = aux_outputs["encoded"][:, :step]
+                aux_outputs["logits"] = aux_outputs["logits"][:, :step]
+                aux_outputs["pre_logits"] = jnp.mean(
+                    aux_outputs["pre_logits"][:, :step], axis=0
+                )
             else:
-                raise ValueError(f"Unknown model type: {self._sample_actions.__repr__()}")
+                raise ValueError(
+                    f"Unknown model type: {self._sample_actions.__repr__()}"
+                )
         else:
             output_tokens = sample_action_outputs
             output_tokens_truncated = output_tokens
             aux_outputs = {}
-        
+
         batch_size = output_tokens.shape[0]
         outputs = {
             "state": inputs["state"].repeat(batch_size, 0),
-            "actions": output_tokens
+            "actions": output_tokens,
         }
 
         outputs_transformed = []
@@ -126,29 +130,30 @@ class Policy(BasePolicy):
         outputs = {
             "state": inputs["state"].repeat(batch_size, 0),
             "raw_actions": output_tokens_truncated,
-            "actions": outputs_transformed["actions"]
+            "actions": outputs_transformed["actions"],
         }
         outputs.update(aux_outputs)
 
         return outputs
-    
-    @override 
+
+    @override
     def infer(self, obs: dict) -> dict:
         outputs = self._infer_maybe_multi(obs)
 
         def _unbatch_leaf(x):
             x = np.asarray(x)
-            
+
             if x.ndim == 0:
                 return x
-            
+
             return x[0]
-        
+
         return jax.tree_util.tree_map(_unbatch_leaf, outputs)
 
     @property
     def metadata(self) -> dict[str, Any]:
         return self._metadata
+
 
 class PolicyRecorder(_base_policy.BasePolicy):
     """Records the policy's behavior to disk."""
@@ -167,7 +172,7 @@ class PolicyRecorder(_base_policy.BasePolicy):
 
         results = {}
         for k in results_multi:
-            if k in ['actions', 'decode_step', "raw_actions"]:
+            if k in ["actions", "decode_step", "raw_actions"]:
                 results[k] = np.asarray(results_multi[k])
             else:
                 results[k] = np.asarray(results_multi[k][0])
@@ -180,16 +185,21 @@ class PolicyRecorder(_base_policy.BasePolicy):
 
         # handle pi0 fast outputs
         if "logits" in meta_to_save:
-            logits, start_index, end_index = self._process_pi0fast_logits(meta_to_save["logits"])
+            logits, start_index, end_index = self._process_pi0fast_logits(
+                meta_to_save["logits"]
+            )
             meta_to_save["logits"] = logits
             meta_to_save["action_start_index_in_vocab"] = start_index
             meta_to_save["action_end_index_in_vocab"] = end_index
 
         # if multiple actions are sampled, remove the intermediate outputs
         if results_multi["actions"].shape[0] > 1:
-            if "encoded" in meta_to_save: del meta_to_save['encoded']
-            if "logits" in meta_to_save: del meta_to_save['logits']
-            if "pre_logits" in meta_to_save: del meta_to_save['pre_logits']
+            if "encoded" in meta_to_save:
+                del meta_to_save["encoded"]
+            if "logits" in meta_to_save:
+                del meta_to_save["logits"]
+            if "pre_logits" in meta_to_save:
+                del meta_to_save["pre_logits"]
 
         self._record_step += 1
 
@@ -198,53 +208,59 @@ class PolicyRecorder(_base_policy.BasePolicy):
             if isinstance(v, (np.ndarray, jnp.ndarray)):
                 if v.dtype == jnp.bfloat16:
                     meta_to_save[k] = v.astype(jnp.float32)
-        
+
         trimmed_results = {
             "state": np.asarray(results_multi["state"][0]),
-            "actions": np.asarray(results_multi["actions"][0])
+            "actions": np.asarray(results_multi["actions"][0]),
         }
         trimmed_results.update(meta_to_save)
 
         return trimmed_results
 
     def _process_pi0fast_logits(self, logits):
-            '''
-            About the meaning of different token indices in vocabulary
-            
-            In the normal case:
-            The first three output tokens should be [4022, 235292, 235248], decoded to "Actions: ". 
-            The last two output token should be [235371, 1], decoded to "|" and "<eos>".
-            The rest of the predicted tokens will be decoded into actual action tokens (looks like <loc0594>). 
+        """
+        About the meaning of different token indices in vocabulary
 
-            The underlying tokenizer has two stages
-            - self._output_transform.transforms[0].tokenizer._paligemma_tokenizer 
-            converts the predicted token id to the corresponding token string. Vocab size is
-            self._paligemma_tokenizer.vocab_size() (text_vocab_size)
-            - self._output_transform.transforms[0].tokenizer._fast_tokenizer
-            converts the action tokens to the action trajectories. Vocab size is 
-            self._output_transform.transforms[0].tokenizer._fast_tokenizer.vocab_size (action_vocab_size)
-            
-            
-            According to FASTTokenizer._act_tokens_to_paligemma_tokens() function, the action tokens are 
-            from text_vocab_size - 1 - self._fast_skip_tokens - action_vocab_size + 1,
-                corresponding to action_vocab_size - 1, inclusive
-            to text_vocab_size - 1 - self._fast_skip_tokens 
-                corresponding to 0, inclusive
-                
-            So the actual slicing index should be 
-            [
-                text_vocab_size - self._fast_skip_tokens - action_vocab_size:
-                text_vocab_size - self._fast_skip_tokens
-            ]
-            '''
-            
-            text_tokenizer = self._policy._output_transform.transforms[0].tokenizer._paligemma_tokenizer
-            action_tokenizer = self._policy._output_transform.transforms[0].tokenizer._fast_tokenizer
-            text_vocab_size = text_tokenizer.vocab_size()
-            action_vocab_size = action_tokenizer.vocab_size
-            fast_skip_tokens = self._policy._output_transform.transforms[0].tokenizer._fast_skip_tokens
-            start_index = text_vocab_size - fast_skip_tokens - action_vocab_size
-            end_index = text_vocab_size - fast_skip_tokens
-            logits = logits[:, start_index:end_index]
-            
-            return logits, start_index, end_index
+        In the normal case:
+        The first three output tokens should be [4022, 235292, 235248], decoded to "Actions: ".
+        The last two output token should be [235371, 1], decoded to "|" and "<eos>".
+        The rest of the predicted tokens will be decoded into actual action tokens (looks like <loc0594>).
+
+        The underlying tokenizer has two stages
+        - self._output_transform.transforms[0].tokenizer._paligemma_tokenizer
+        converts the predicted token id to the corresponding token string. Vocab size is
+        self._paligemma_tokenizer.vocab_size() (text_vocab_size)
+        - self._output_transform.transforms[0].tokenizer._fast_tokenizer
+        converts the action tokens to the action trajectories. Vocab size is
+        self._output_transform.transforms[0].tokenizer._fast_tokenizer.vocab_size (action_vocab_size)
+
+
+        According to FASTTokenizer._act_tokens_to_paligemma_tokens() function, the action tokens are
+        from text_vocab_size - 1 - self._fast_skip_tokens - action_vocab_size + 1,
+            corresponding to action_vocab_size - 1, inclusive
+        to text_vocab_size - 1 - self._fast_skip_tokens
+            corresponding to 0, inclusive
+
+        So the actual slicing index should be
+        [
+            text_vocab_size - self._fast_skip_tokens - action_vocab_size:
+            text_vocab_size - self._fast_skip_tokens
+        ]
+        """
+
+        text_tokenizer = self._policy._output_transform.transforms[
+            0
+        ].tokenizer._paligemma_tokenizer
+        action_tokenizer = self._policy._output_transform.transforms[
+            0
+        ].tokenizer._fast_tokenizer
+        text_vocab_size = text_tokenizer.vocab_size()
+        action_vocab_size = action_tokenizer.vocab_size
+        fast_skip_tokens = self._policy._output_transform.transforms[
+            0
+        ].tokenizer._fast_skip_tokens
+        start_index = text_vocab_size - fast_skip_tokens - action_vocab_size
+        end_index = text_vocab_size - fast_skip_tokens
+        logits = logits[:, start_index:end_index]
+
+        return logits, start_index, end_index

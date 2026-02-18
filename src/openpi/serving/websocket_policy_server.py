@@ -4,10 +4,10 @@ import logging
 import time
 import traceback
 
-from openpi_client import base_policy as _base_policy
-from openpi_client import msgpack_numpy
 import websockets.asyncio.server as _server
 import websockets.frames
+from openpi_client import base_policy as _base_policy
+from openpi_client import msgpack_numpy
 
 logger = logging.getLogger(__name__)
 
@@ -61,9 +61,16 @@ class WebsocketPolicyServer:
                 action = self._policy.infer(obs)
 
                 # patch to ensure data can be transmitted
-                action["encoded"] = action["encoded"].astype("float32")
-                action["logits"] = action["logits"].astype("float32")
-                action["pre_logits"] = action["pre_logits"].astype("float32")
+                # FIXME: Add aux outputs for Pi0 and Pi0.5
+                if all(
+                    k in action.keys()
+                    for k in ["encoded", "logits", "pre_logits"]
+                ):
+                    action["encoded"] = action["encoded"].astype("float32")
+                    action["logits"] = action["logits"].astype("float32")
+                    action["pre_logits"] = action["pre_logits"].astype(
+                        "float32"
+                    )
 
                 infer_time = time.monotonic() - infer_time
 
@@ -72,13 +79,17 @@ class WebsocketPolicyServer:
                 }
                 if prev_total_time is not None:
                     # We can only record the last total time since we also want to include the send time.
-                    action["server_timing"]["prev_total_ms"] = prev_total_time * 1000
+                    action["server_timing"]["prev_total_ms"] = (
+                        prev_total_time * 1000
+                    )
 
                 await websocket.send(packer.pack(action))
                 prev_total_time = time.monotonic() - start_time
 
             except websockets.ConnectionClosed:
-                logger.info(f"Connection from {websocket.remote_address} closed")
+                logger.info(
+                    f"Connection from {websocket.remote_address} closed"
+                )
                 break
             except Exception:
                 await websocket.send(traceback.format_exc())
@@ -89,7 +100,9 @@ class WebsocketPolicyServer:
                 raise
 
 
-def _health_check(connection: _server.ServerConnection, request: _server.Request) -> _server.Response | None:
+def _health_check(
+    connection: _server.ServerConnection, request: _server.Request
+) -> _server.Response | None:
     if request.path == "/healthz":
         return connection.respond(http.HTTPStatus.OK, "OK\n")
     # Continue with the normal request handling.

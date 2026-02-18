@@ -10,13 +10,13 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import torch
-from openpi.models import model as _model
-from openpi.shared import array_typing as at
-from openpi.shared import nnx_utils
 from openpi_client import base_policy as _base_policy
 from typing_extensions import override
 
 from openpi import transforms as _transforms
+from openpi.models import model as _model
+from openpi.shared import array_typing as at
+from openpi.shared import nnx_utils
 
 BasePolicy: TypeAlias = _base_policy.BasePolicy
 
@@ -47,11 +47,6 @@ class Policy(BasePolicy):
                           Only relevant when is_pytorch=True.
             is_pytorch: Whether the model is a PyTorch model. If False, assumes JAX model.
         """
-        self._sample_actions = nnx_utils.module_jit(
-            model.sample_actions,
-            static_argnames=("temperature", "n_action_samples"),
-        )
-
         self._model = model
         self._input_transform = _transforms.compose(transforms)
         self._output_transform = _transforms.compose(output_transforms)
@@ -136,19 +131,120 @@ class Policy(BasePolicy):
 
         return outputs
 
+    # @override
+    # def infer(self, obs: dict) -> dict:
+    #     outputs = self._infer_maybe_multi(obs)
+
+    #     def _unbatch_leaf(x):
+    #         if self._is_pytorch_model:
+    #             x = x.detach().cpu()
+    #         x = np.asarray(x)
+
+    #         if x.ndim == 0:
+    #             return x
+
+    #         return x[0]
+
+    #     return jax.tree_util.tree_map(_unbatch_leaf, outputs)
+
     @override
-    def infer(self, obs: dict) -> dict:
-        outputs = self._infer_maybe_multi(obs)
+    def infer(self, obs: dict, *, noise: np.ndarray | None = None) -> dict:  # type: ignore[misc]
+        # Make a copy since transformations may modify the inputs in place.
+        inputs = jax.tree.map(lambda x: x, obs)
+        inputs = self._input_transform(inputs)
+        if not self._is_pytorch_model:
+            # Make a batch and convert to jax.Array.
+            inputs = jax.tree.map(
+                lambda x: jnp.asarray(x)[np.newaxis, ...], inputs
+            )
+            self._rng, sample_rng_or_pytorch_device = jax.random.split(
+                self._rng
+            )
+        else:
+            # Convert inputs to PyTorch tensors and move to correct device
+            inputs = jax.tree.map(
+                lambda x: torch.from_numpy(np.array(x)).to(
+                    self._pytorch_device
+                )[None, ...],
+                inputs,
+            )
+            sample_rng_or_pytorch_device = self._pytorch_device
 
-        def _unbatch_leaf(x):
-            x = np.asarray(x)
+        # Prepare kwargs for sample_actions
+        sample_kwargs = dict(self._sample_kwargs)
+        if noise is not None:
+            noise = (
+                torch.from_numpy(noise).to(self._pytorch_device)
+                if self._is_pytorch_model
+                else jnp.asarray(noise)
+            )
 
-            if x.ndim == 0:
-                return x
+            if (
+                noise.ndim == 2
+            ):  # If noise is (action_horizon, action_dim), add batch dimension
+                noise = noise[
+                    None, ...
+                ]  # Make it (1, action_horizon, action_dim)
+            sample_kwargs["noise"] = noise
 
-            return x[0]
+        observation = _model.Observation.from_dict(inputs)
+        start_time = time.monotonic()
 
-        return jax.tree_util.tree_map(_unbatch_leaf, outputs)
+        sample_action_outputs = self._sample_actions(
+            sample_rng_or_pytorch_device, observation, **sample_kwargs
+        )
+        if isinstance(sample_action_outputs, tuple):
+            if "Pi0.sample_actions" in self._sample_actions.__repr__():
+                output_tokens, aux_outputs = sample_action_outputs
+                output_tokens_truncated = output_tokens
+                aux_outputs["pre_logits"] = jnp.mean(
+                    aux_outputs["pre_velocity"][:, :step], axis=0
+                )
+            elif "Pi0FAST.sample_actions" in self._sample_actions.__repr__():
+                output_tokens, aux_outputs = sample_action_outputs
+                # process the output and cut off the unused positions
+                step = aux_outputs["decode_step"].max()
+                output_tokens_truncated = output_tokens[:, :step]
+                # FIXME: Add aux outputs for Pi0 and Pi0.5
+                aux_outputs["encoded"] = aux_outputs["encoded"][:, :step]
+                aux_outputs["logits"] = aux_outputs["logits"][:, :step]
+                aux_outputs["pre_logits"] = jnp.mean(
+                    aux_outputs["pre_logits"][:, :step], axis=0
+                )
+            else:
+                raise ValueError(
+                    f"Unknown model type: {self._sample_actions.__repr__()}"
+                )
+        else:
+            output_tokens = sample_action_outputs
+            output_tokens_truncated = output_tokens
+            aux_outputs = {}
+
+        outputs = {
+            "state": inputs["state"],
+            "actions": output_tokens,
+        }
+        model_time = time.monotonic() - start_time
+        if self._is_pytorch_model:
+            outputs = jax.tree.map(
+                lambda x: np.asarray(x[0, ...].detach().cpu()), outputs
+            )
+            aux_outputs = jax.tree.map(
+                lambda x: np.asarray(x.detach().cpu()), aux_outputs
+            )
+            output_tokens_truncated = np.asarray(
+                output_tokens_truncated.detach().cpu()
+            )
+        else:
+            outputs = jax.tree.map(lambda x: np.asarray(x[0, ...]), outputs)
+
+        outputs = self._output_transform(outputs)
+        outputs["policy_timing"] = {
+            "infer_ms": model_time * 1000,
+        }
+        outputs["raw_actions"] = output_tokens_truncated
+        outputs.update(aux_outputs)
+        return outputs
 
     @property
     def metadata(self) -> dict[str, Any]:

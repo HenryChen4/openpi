@@ -60,17 +60,9 @@ class WebsocketPolicyServer:
                 infer_time = time.monotonic()
                 action = self._policy.infer(obs)
 
-                # patch to ensure data can be transmitted
-                # FIXME: Add aux outputs for Pi0 and Pi0.5
-                if all(
-                    k in action.keys()
-                    for k in ["encoded", "logits", "pre_logits"]
-                ):
-                    action["encoded"] = action["encoded"].astype("float32")
-                    action["logits"] = action["logits"].astype("float32")
-                    action["pre_logits"] = action["pre_logits"].astype(
-                        "float32"
-                    )
+                # FIXME: type casting should be moved into policy classes
+                if "embedding" in action:
+                    action["embedding"] = action["embedding"].astype("float32")
 
                 infer_time = time.monotonic() - infer_time
 

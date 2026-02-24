@@ -120,7 +120,7 @@ class Policy(BasePolicy):
                 step = aux["decode_step"].max()
                 # FIXME: Add aux outputs for Pi0 and Pi0.5
                 aux_outputs["embedding"] = jnp.mean(
-                    aux["pre_logits"][:, :step], axis=0
+                    aux["pre_logits"][:, :step].squeeze(), axis=0
                 )
             else:
                 raise ValueError(

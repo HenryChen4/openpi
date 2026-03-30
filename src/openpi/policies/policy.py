@@ -1,15 +1,15 @@
+from collections.abc import Sequence
 import logging
 import pathlib
 import time
-from collections.abc import Sequence
 from typing import Any, TypeAlias
 
 import flax
 import jax
 import jax.numpy as jnp
 import numpy as np
-import torch
 from openpi_client import base_policy as _base_policy
+import torch
 from typing_extensions import override
 
 from openpi import transforms as _transforms
@@ -113,7 +113,9 @@ class Policy(BasePolicy):
         if isinstance(sample_action_outputs, tuple):
             if "Pi0.sample_actions" in self._sample_actions.__repr__():
                 output_tokens, aux = sample_action_outputs
-                aux_outputs["embedding"] = jnp.mean(aux["pre_velocity"], axis=0)
+                aux_outputs["embedding"] = aux["pre_velocity"][
+                    :, 0, 0
+                ].squeeze()
             elif "Pi0FAST.sample_actions" in self._sample_actions.__repr__():
                 output_tokens, aux = sample_action_outputs
                 # process the output and cut off the unused positions

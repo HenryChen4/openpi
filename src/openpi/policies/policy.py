@@ -1,21 +1,21 @@
-from collections.abc import Sequence
 import logging
 import pathlib
 import time
+from collections.abc import Sequence
 from typing import Any, TypeAlias
 
 import flax
 import jax
 import jax.numpy as jnp
 import numpy as np
-from openpi_client import base_policy as _base_policy
 import torch
-from typing_extensions import override
-
-from openpi import transforms as _transforms
 from openpi.models import model as _model
 from openpi.shared import array_typing as at
 from openpi.shared import nnx_utils
+from openpi_client import base_policy as _base_policy
+from typing_extensions import override
+
+from openpi import transforms as _transforms
 
 BasePolicy: TypeAlias = _base_policy.BasePolicy
 
@@ -111,19 +111,12 @@ class Policy(BasePolicy):
         )
         aux_outputs = {}
         if isinstance(sample_action_outputs, tuple):
-            if "Pi0.sample_actions" in self._sample_actions.__repr__():
-                output_tokens, aux = sample_action_outputs
-                aux_outputs["embedding"] = aux["pre_velocity"][
-                    :, 0, 0
-                ].squeeze()
-            elif "Pi0FAST.sample_actions" in self._sample_actions.__repr__():
-                output_tokens, aux = sample_action_outputs
-                # process the output and cut off the unused positions
-                step = aux["decode_step"].max()
-                # FIXME: Add aux outputs for Pi0 and Pi0.5
-                aux_outputs["embedding"] = jnp.mean(
-                    aux["pre_logits"][:, :step].squeeze(), axis=0
-                )
+            if (
+                "Pi0.sample_actions" in self._sample_actions.__repr__()
+                or "Pi0FAST.sample_actions" in self._sample_actions.__repr__()
+            ):
+                output_tokens, embedding = sample_action_outputs
+                aux_outputs["embedding"] = embedding
             else:
                 raise ValueError(
                     f"Unknown model type: {self._sample_actions.__repr__()}"

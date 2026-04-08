@@ -236,9 +236,8 @@ class Pi0(_model.BaseModel):
         positions = jnp.cumsum(prefix_mask, axis=1) - 1
         _, kv_cache = self.PaliGemma.llm([prefix_tokens, None], mask=prefix_attn_mask, positions=positions)
 
-        feature_dim = self.PaliGemma.llm.module.configs[1].width
-
         # pre-velocity layer activations as embeddings
+        feature_dim = self.PaliGemma.llm.module.configs[1].width
         pre_vel_acc = jnp.zeros((batch_size, num_steps, self.action_horizon, feature_dim), dtype=jnp.float32)
 
         def step(carry):
@@ -283,7 +282,9 @@ class Pi0(_model.BaseModel):
             # robust to floating-point error
             return time >= -dt / 2
 
-        x_0, _, flow_pre_vel, _ = jax.lax.while_loop(cond, step, (noise, 1.0, pre_vel_acc, 0))
-        pre_vel_embeddings = flow_pre_vel[:, 0, 0].squeeze()
+        x_0, _, _, _ = jax.lax.while_loop(cond, step, (noise, 1.0, pre_vel_acc, 0))
 
-        return x_0, pre_vel_embeddings
+        # Remove noise from embeddings by making a separate flow from all-zero noise; take the first flow-step at first action
+        _, _, pre_vel_embeddings, _ = step((jnp.zeros((batch_size, self.action_horizon, self.action_dim)), 1.0, jnp.zeros((batch_size, 1, self.action_horizon, feature_dim), dtype=jnp.float32), 0))
+
+        return x_0, pre_vel_embeddings[:, 0, 0]

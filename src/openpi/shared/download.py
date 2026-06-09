@@ -80,6 +80,9 @@ def maybe_download(url: str, *, force_download: bool = False, **kwargs) -> pathl
                 else:
                     local_path.unlink()
 
+            if local_path.exists():
+                return local_path
+
             # Download the data to a local cache.
             logger.info(f"Downloading {url} to {local_path}")
             scratch_path = local_path.with_suffix(".partial")
